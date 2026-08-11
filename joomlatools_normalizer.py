@@ -203,44 +203,38 @@ def parse_wrapper_metadata(source_zip: zipfile.ZipFile, payload_manifest: dict) 
     )
 
 
-def build_package_manifest(pkg_element: str, version: str, extensions: List[ExtensionPackage], meta: WrapperMetadata) -> str:
-    files = []
-    for ext in extensions:
-        attrs = [f'type="{ext.type}"']
-        if ext.group:
-            attrs.append(f'group="{ext.group}"')
-        attrs.append(f'id="{ext.element}"')
-        files.append(f'        <file {" ".join(attrs)}>{ext.archive_name}</file>')
-
-    package_name = pkg_element[4:] if pkg_element.startswith('pkg_') else pkg_element
-
+def build_component_manifest(meta: WrapperMetadata) -> str:
     return "\n".join([
         '<?xml version="1.0" encoding="utf-8"?>',
-        '<extension type="package" method="upgrade" version="3.0">',
-        f'    <name>{pkg_element}</name>',
-        f'    <packagename>{package_name}</packagename>',
+        '<extension type="component" version="3.0" method="upgrade">',
+        '    <name>com_joomlatools_installer</name>',
         f'    <author>{meta.author}</author>',
         f'    <creationDate>{meta.creation_date}</creationDate>',
         f'    <copyright>{meta.copyright}</copyright>',
         f'    <license>{meta.license}</license>',
         f'    <authorEmail>{meta.author_email}</authorEmail>',
         f'    <authorUrl>{meta.author_url}</authorUrl>',
-        f'    <version>{version or "1.0.0"}</version>',
-        '    <description>Standard Joomla package generated from a Joomlatools wrapper installer while preserving payload archives and installer checks.</description>',
+        '    <version>1.0.0</version>',
+        '    <description>Standard Joomla component wrapper generated from a Joomlatools installer for remote-safe synchronous payload installs.</description>',
         '    <scriptfile>script.php</scriptfile>',
-        '    <blockChildUninstall>false</blockChildUninstall>',
+        '    <administration>',
+        '        <files>',
+        '            <filename>joomlatools_installer.php</filename>',
+        '        </files>',
+        '    </administration>',
         '    <files>',
-        *files,
+        '        <filename>joomlatools_installer.php</filename>',
+        '        <folder>payload</folder>',
         '    </files>',
         '</extension>',
         '',
     ])
 
 
-PHP_SCRIPT_TEMPLATE = r'''<?php
+PHP_WRAPPER_SCRIPT_TEMPLATE = r'''<?php
 defined('_JEXEC') or die;
 
-class {class_name}
+class com_joomlatools_installerInstallerScript
 {{
     protected $minimumPhpVersion = '{min_php}';
     protected $minimumJoomlaVersion = '{min_joomla}';
@@ -300,6 +294,21 @@ class {class_name}
         return null;
     }}
 
+    protected function getSourcePath($adapter)
+    {{
+        $target = $this->getAbortHandler($adapter);
+
+        if (is_object($target) && method_exists($target, 'getPath')) {{
+            return $target->getPath('source');
+        }}
+
+        if (is_object($adapter) && method_exists($adapter, 'getPath')) {{
+            return $adapter->getPath('source');
+        }}
+
+        return null;
+    }}
+
     protected function getJoomlaVersion()
     {{
         if (defined('JVERSION')) {{
@@ -333,6 +342,147 @@ class {class_name}
         }}
 
         return \Joomla\CMS\Plugin\PluginHelper::isEnabled('behaviour', 'compat6');
+    }}
+
+    protected function validateFrameworkVersion($adapter)
+    {{
+        $source = $this->getSourcePath($adapter);
+
+        if (!$source) {{
+            return true;
+        }}
+
+        $payloadKoowa = rtrim($source, '/\\') . '/payload/framework/libraries/joomlatools/library/koowa.php';
+        $currentKoowa = JPATH_LIBRARIES . '/joomlatools/library/koowa.php';
+
+        if (!is_file($payloadKoowa) || !is_file($currentKoowa)) {{
+            return true;
+        }}
+
+        $payloadVersion = null;
+        $currentVersion = null;
+
+        if (preg_match("#const\s+VERSION\s+=\s+'(.*?)'#i", file_get_contents($payloadKoowa), $matches)) {{
+            $payloadVersion = $matches[1];
+        }}
+
+        if (preg_match("#const\s+VERSION\s+=\s+'(.*?)'#i", file_get_contents($currentKoowa), $matches)) {{
+            $currentVersion = $matches[1];
+        }}
+
+        if ($payloadVersion && $currentVersion && version_compare($payloadVersion, $currentVersion, '<')) {{
+            $message = sprintf(
+                'Your site is running Joomlatools Framework %s. This package ships version %s which is older and cannot be installed. Please use a newer version of the package.',
+                $currentVersion,
+                $payloadVersion
+            );
+
+            return $this->abortInstall($adapter, $message);
+        }}
+
+        return true;
+    }}
+
+    protected function loadPayloadManifest($adapter)
+    {{
+        $source = $this->getSourcePath($adapter);
+
+        if (!$source) {{
+            return null;
+        }}
+
+        $manifestPath = rtrim($source, '/\\') . '/payload/manifest.json';
+
+        if (!is_file($manifestPath)) {{
+            return null;
+        }}
+
+        $manifest = json_decode(file_get_contents($manifestPath));
+
+        return (is_object($manifest) && !empty($manifest->packages) && is_array($manifest->packages)) ? $manifest : null;
+    }}
+
+    protected function installPayload($adapter, $manifest)
+    {{
+        $source = $this->getSourcePath($adapter);
+
+        if (!$source) {{
+            return $this->abortInstall($adapter, 'The Joomlatools installer source path could not be resolved.');
+        }}
+
+        foreach ($manifest->packages as $package) {{
+            if (empty($package->path)) {{
+                return $this->abortInstall($adapter, 'The Joomlatools installer payload contains an invalid package.');
+            }}
+
+            $path = rtrim($source, '/\\') . '/payload/' . trim($package->path, '/\\');
+            $title = !empty($package->title) ? $package->title : $package->path;
+
+            if (!is_dir($path)) {{
+                return $this->abortInstall($adapter, sprintf("The '%s' installer payload could not be found.", $title));
+            }}
+
+            $payloadInstaller = new \Joomla\CMS\Installer\Installer();
+
+            if (method_exists($payloadInstaller, 'setDatabase')) {{
+                $payloadInstaller->setDatabase(\Joomla\CMS\Factory::getDbo());
+            }}
+
+            if (!$payloadInstaller->install($path)) {{
+                return $this->abortInstall($adapter, sprintf("The '%s' installer payload failed to install.", $title));
+            }}
+        }}
+
+        return true;
+    }}
+
+    protected function setSuccessState($adapter, $manifest)
+    {{
+        $successUrl = isset($manifest->success_url) && $manifest->success_url ? $manifest->success_url : $this->successUrl;
+        $successText = isset($manifest->success_text) && $manifest->success_text ? $manifest->success_text : $this->successText;
+
+        try {{
+            $app = \Joomla\CMS\Factory::getApplication();
+            $app->setUserState('com_installer.redirect_url', $successUrl);
+            $app->enqueueMessage($successText, 'message');
+        }} catch (\Throwable $e) {{
+        }} catch (\Exception $e) {{
+        }}
+
+        try {{
+            $target = $this->getAbortHandler($adapter);
+            if (is_object($target) && method_exists($target, 'setRedirectUrl')) {{
+                $target->setRedirectUrl($successUrl);
+            }}
+        }} catch (\Throwable $e) {{
+        }} catch (\Exception $e) {{
+        }}
+    }}
+
+    protected function selfDestruct()
+    {{
+        try {{
+            $db = \Joomla\CMS\Factory::getDbo();
+            $query = $db->getQuery(true)
+                ->select($db->quoteName('extension_id'))
+                ->from($db->quoteName('#__extensions'))
+                ->where($db->quoteName('type') . ' = ' . $db->quote('component'))
+                ->where($db->quoteName('element') . ' = ' . $db->quote('com_joomlatools_installer'));
+
+            $extensionId = (int) $db->setQuery($query, 0, 1)->loadResult();
+
+            if ($extensionId > 0) {{
+                $installer = new \JInstaller();
+
+                if (method_exists($installer, 'setDatabase')) {{
+                    $installer->setDatabase($db);
+                }}
+
+                $installer->uninstall('component', $extensionId, 1);
+            }}
+        }} catch (\Throwable $e) {{
+        }} catch (\Exception $e) {{
+        }}
     }}
 
     public function preflight($type, $adapter)
@@ -381,105 +531,38 @@ class {class_name}
             return $this->abortInstall($adapter, $message);
         }}
 
+        if (!$this->validateFrameworkVersion($adapter)) {{
+            return false;
+        }}
+
         return true;
     }}
 
-		protected function cleanupLegacyPackageRows()
-			{{
-					try {{
-							$db = \Joomla\CMS\Factory::getDbo();
-			
-							// Remove only clearly broken legacy package records.
-							// Keep the current correct package element: pkg_docman
-							$query = $db->getQuery(true)
-									->delete($db->quoteName('#__extensions'))
-									->where($db->quoteName('type') . ' = ' . $db->quote('package'))
-									->where($db->quoteName('element') . ' IN (' . $db->quote('docman') . ', ' . $db->quote('pkg_docman') . ')');
-			
-							$db->setQuery($query)->execute();
-					}} catch (\Throwable $e) {{
-					}} catch (\Exception $e) {{
-					}}
-			}}
-			
-			protected function cleanupLegacyPackageManifestFiles()
-			{{
-					try {{
-							$files = array(
-									JPATH_ADMINISTRATOR . '/manifests/packages/pkg_docman.xml',
-							);
-			
-							foreach ($files as $file) {{
-									if (is_file($file)) {{
-											\Joomla\CMS\Filesystem\File::delete($file);
-									}}
-							}}
-					}} catch (\Throwable $e) {{
-					}} catch (\Exception $e) {{
-					}}
-			}}
-
     public function postflight($type, $adapter)
-		{{
-				if ($type === 'discover_install') {{
-						return true;
-				}}
-		
-				try {{
-						$app = \Joomla\CMS\Factory::getApplication();
-						$app->setUserState('com_installer.redirect_url', $this->successUrl);
-						$app->enqueueMessage($this->successText, 'message');
-				}} catch (\Throwable $e) {{
-				}} catch (\Exception $e) {{
-				}}
-		
-				try {{
-						$target = $this->getAbortHandler($adapter);
-						if (is_object($target) && method_exists($target, 'setRedirectUrl')) {{
-								$target->setRedirectUrl($this->successUrl);
-						}}
-				}} catch (\Throwable $e) {{
-				}} catch (\Exception $e) {{
-				}}
-		
-				// Clean up legacy broken package records (NOT the current valid one)
-				if ($type === 'install' || $type === 'update') {{
-						try {{
-								$db = \Joomla\CMS\Factory::getDbo();
-		
-								$query = $db->getQuery(true)
-										->delete($db->quoteName('#__extensions'))
-										->where($db->quoteName('type') . ' = ' . $db->quote('package'))
-										->where(
-												$db->quoteName('element') . ' IN (' .
-												$db->quote('docman') . ', ' .
-												$db->quote('pkg_docman') .
-												')'
-										);
-		
-								$db->setQuery($query)->execute();
-						}} catch (\Throwable $e) {{
-						}} catch (\Exception $e) {{
-						}}
-		
-						// Remove stale manifest files from older bad installs
-						try {{
-								$files = array(
-										JPATH_ADMINISTRATOR . '/manifests/packages/pkg_docman.xml',
-								);
-		
-								foreach ($files as $file) {{
-										if (is_file($file)) {{
-												\Joomla\CMS\Filesystem\File::delete($file);
-										}}
-								}}
-						}} catch (\Throwable $e) {{
-						}} catch (\Exception $e) {{
-						}}
-				}}
-		
-				return true;
-		}}
+    {{
+        if ($type === 'discover_install') {{
+            return true;
+        }}
+
+        if ($type !== 'install' && $type !== 'update') {{
+            return true;
+        }}
+
+        $manifest = $this->loadPayloadManifest($adapter);
+
+        if (!$manifest) {{
+            return $this->abortInstall($adapter, 'The Joomlatools installer payload manifest is invalid or missing.');
+        }}
+
+        if (!$this->installPayload($adapter, $manifest)) {{
+            return false;
+        }}
+
+        $this->setSuccessState($adapter, $manifest);
+        $this->selfDestruct();
+
+        return true;
+    }}
 }}
 '''
 
@@ -488,9 +571,8 @@ def php_single_quote(value: str) -> str:
     return value.replace('\\', '\\\\').replace("'", "\\'")
 
 
-def build_package_script(pkg_class: str, meta: WrapperMetadata) -> str:
-    return PHP_SCRIPT_TEMPLATE.format(
-        class_name=pkg_class,
+def build_component_script(meta: WrapperMetadata) -> str:
+    return PHP_WRAPPER_SCRIPT_TEMPLATE.format(
         min_php=php_single_quote(meta.min_php),
         min_joomla=php_single_quote(meta.min_joomla),
         old_docman_floor=php_single_quote(meta.old_docman_floor),
@@ -499,29 +581,32 @@ def build_package_script(pkg_class: str, meta: WrapperMetadata) -> str:
     )
 
 
-def build_readme(pkg_element: str, extensions: List[ExtensionPackage], meta: WrapperMetadata, output_name: str) -> str:
+def build_readme(extensions: List[ExtensionPackage], meta: WrapperMetadata, output_name: str) -> str:
     rows = [
-        f'Generated package: {output_name}',
-        f'Package element: {pkg_element}',
+        f'Generated wrapper: {output_name}',
+        'Wrapper type: standard Joomla component',
+        'Temporary component: com_joomlatools_installer',
         '',
-        'Preserved payload archives:',
+        'Embedded payload installers:',
     ]
     for ext in extensions:
-        rows.append(f'- {ext.archive_name} ({ext.type}: {ext.title} {ext.version})')
+        rows.append(f'- {ext.payload_path} ({ext.type}: {ext.title} {ext.version})')
     rows += [
         '',
-        'Wrapper behavior recreated in package script:',
+        'Wrapper behavior recreated in script.php:',
         f'- DOCman old-version floor check: < {meta.old_docman_floor}',
         f'- Minimum PHP version check: {meta.min_php}',
         f'- Minimum Joomla version check: {meta.min_joomla}',
+        '- Framework downgrade protection',
         '- Joomla 5/6 backward compatibility plugin requirement',
         f'- Success redirect URL: {meta.success_url}',
         f'- Success message: {meta.success_text}',
+        '- Synchronous payload install during postflight()',
+        '- Automatic self-uninstall of com_joomlatools_installer after payload install',
         '',
-        'Wrapper-only behavior intentionally omitted:',
-        '- Temporary com_joomlatools_installer component',
-        '- AJAX progress UI / staged JSON installer endpoint',
-        '- Self-destruct uninstall of the temporary installer component',
+        'Wrapper behavior intentionally omitted:',
+        '- Browser-only AJAX progress UI',
+        '- Redirect to a temporary installer screen before payload install',
     ]
     return '\n'.join(rows) + '\n'
 
@@ -560,6 +645,18 @@ def build_install_order_txt(extensions: List[ExtensionPackage], meta: WrapperMet
     return '\n'.join(lines) + '\n'
 
 
+def build_component_entrypoint() -> str:
+    return "\n".join([
+        '<?php',
+        "defined('_JEXEC') or die;",
+        '',
+        '// This temporary component exists only so Joomla can register the wrapper',
+        '// and run script.php, which installs the real payload extensions and',
+        '// then uninstalls this wrapper again.',
+        '',
+    ])
+
+
 def parse_args() -> tuple:
     """Parse command-line arguments, returning (input_zip, output_path, split_mode)."""
     args = [a for a in sys.argv[1:] if a != '--split']
@@ -573,8 +670,8 @@ def parse_args() -> tuple:
             f'  {script} --split /path/to/input.zip [/path/to/output_dir]\n'
             f'\n'
             f'Options:\n'
-            f'  --split   Output individual extension ZIPs instead of a single package.\n'
-            f'            This avoids creating a pkg_* entry in Extension Manager.'
+            f'  --split   Output individual extension ZIPs instead of a single wrapper ZIP.\n'
+            f'            This avoids creating a temporary installer component.'
         )
 
     input_zip = args[0]
@@ -619,10 +716,6 @@ def main() -> int:
             extensions.append(ext)
 
         main_name = main_component.element if main_component else 'joomlatools'
-        slug = re.sub(r'^com_', '', main_name)
-        pkg_element = f'pkg_{slug}'
-        pkg_class = f'{pkg_element}InstallerScript'
-        package_version = main_component.version if main_component and main_component.version else '1.0.0'
 
         # ── Split mode: output individual extension ZIPs ──────────────
         if split_mode:
@@ -673,18 +766,18 @@ def main() -> int:
             print(f'Install the {len(extensions)} ZIPs in numbered order.')
             return 0
 
-        # ── Package mode (default): single package ZIP ────────────────
+        # ── Wrapper mode (default): single component ZIP ──────────────
         output_zip = output_path
         if output_zip is None:
             output_zip = os.path.join(
                 os.path.dirname(os.path.abspath(input_zip)),
-                f'{main_name}_normal_v2.zip'
+                f'{main_name}_normalized.zip'
             )
 
         report = {
-            'mode': 'package',
-            'package': pkg_element,
-            'class_name': pkg_class,
+            'mode': 'component_wrapper',
+            'component': 'com_joomlatools_installer',
+            'script_class': 'com_joomlatools_installerInstallerScript',
             'source_file': os.path.basename(input_zip),
             'source_sha256': sha256_file(input_zip),
             'generated_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
@@ -699,13 +792,35 @@ def main() -> int:
                 'archive_size': len(extension_bytes[ext.archive_name]),
             })
 
-        with zipfile.ZipFile(output_zip, 'w', compression=zipfile.ZIP_DEFLATED) as out:
-            for ext in extensions:
-                out.writestr(ext.archive_name, extension_bytes[ext.archive_name])
-            out.writestr(f'{pkg_element}.xml', build_package_manifest(pkg_element, package_version, extensions, meta))
-            out.writestr('script.php', build_package_script(pkg_class, meta))
+        with zipfile.ZipFile(output_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as out:
+            for info in source_zip.infolist():
+                name = info.filename
+                if not (name == 'payload/' or name.startswith('payload/')):
+                    continue
+                if name.endswith('/'):
+                    zinfo = zipfile.ZipInfo(name)
+                    zinfo.date_time = info.date_time
+                    zinfo.external_attr = info.external_attr
+                    zinfo.compress_type = zipfile.ZIP_STORED
+                    out.writestr(zinfo, b'')
+                else:
+                    zinfo = zipfile.ZipInfo(name)
+                    zinfo.date_time = info.date_time
+                    zinfo.external_attr = info.external_attr
+                    zinfo.comment = info.comment
+                    zinfo.extra = info.extra
+                    zinfo.compress_type = zipfile.ZIP_DEFLATED
+                    out.writestr(zinfo, source_zip.read(name))
+
+            if 'joomlatools_installer.php' in source_zip.namelist():
+                out.writestr('joomlatools_installer.php', source_zip.read('joomlatools_installer.php'))
+            else:
+                out.writestr('joomlatools_installer.php', build_component_entrypoint())
+
+            out.writestr('joomlatools_installer.xml', build_component_manifest(meta))
+            out.writestr('script.php', build_component_script(meta))
             out.writestr('conversion-report.json', json.dumps(report, indent=2))
-            out.writestr('README-normalized-package.txt', build_readme(pkg_element, extensions, meta, os.path.basename(output_zip)))
+            out.writestr('README-normalized-wrapper.txt', build_readme(extensions, meta, os.path.basename(output_zip)))
 
         print(f'Created: {output_zip}')
         print(f'SHA256: {sha256_file(output_zip)}')
